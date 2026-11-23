@@ -91,7 +91,7 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+c.cfg.AgentToken)
-	headers.Set("User-Agent", "sovrack-agent/3.1.0")
+	headers.Set("User-Agent", "sovrack-agent/1.0.0")
 
 	conn, resp, err := dialer.DialContext(ctx, c.cfg.ServerURL, headers)
 	if err != nil {

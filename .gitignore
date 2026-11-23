@@ -1,0 +1,15 @@
+# Binaries
+bin/
+agent.exe
+sovrack-agent
+*.exe
+
+# Environment & configs
+.env
+agent.env
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
