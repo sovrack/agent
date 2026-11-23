@@ -54,6 +54,20 @@ func Load() (*Config, error) {
 		return nil, errors.New("agent authentication token is required (set via -token flag or SOVRACK_AGENT_TOKEN env var)")
 	}
 
+	// Normalize ServerURL so that http(s):// or raw hostnames are cleanly transformed to ws(s)://.../agent-tunnel
+	serverURL := strings.TrimSpace(cfg.ServerURL)
+	if strings.HasPrefix(serverURL, "http://") {
+		serverURL = "ws://" + strings.TrimPrefix(serverURL, "http://")
+	} else if strings.HasPrefix(serverURL, "https://") {
+		serverURL = "wss://" + strings.TrimPrefix(serverURL, "https://")
+	} else if !strings.HasPrefix(serverURL, "ws://") && !strings.HasPrefix(serverURL, "wss://") {
+		serverURL = "wss://" + serverURL
+	}
+	if !strings.HasSuffix(serverURL, "/agent-tunnel") {
+		serverURL = strings.TrimRight(serverURL, "/") + "/agent-tunnel"
+	}
+	cfg.ServerURL = serverURL
+
 	return cfg, nil
 }
 
