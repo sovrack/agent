@@ -14,7 +14,7 @@ import (
 	"github.com/sovrack/agent/internal/tunnel"
 )
 
-const Version = "3.1.0"
+const Version = "1.0.0"
 
 func main() {
 	fmt.Printf("\n=== Sovrack Outbound Tunnel Agent v%s ===\n", Version)

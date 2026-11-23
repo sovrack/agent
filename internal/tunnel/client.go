@@ -147,7 +147,7 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 func (c *Client) sendHello() error {
 	hostInfo := c.metrics.GetHostInfo()
 	payload, err := json.Marshal(map[string]interface{}{
-		"version":  "3.1.0",
+		"version":  "1.0.0",
 		"host":     hostInfo,
 		"protocol": "sovrack-agent-v1",
 	})
