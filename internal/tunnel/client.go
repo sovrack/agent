@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,25 +18,7 @@ import (
 	"github.com/sovrack/agent/internal/metrics"
 )
 
-type MessageType string
-
-const (
-	TypeAgentHello     MessageType = "AGENT_HELLO"
-	TypeAgentPing      MessageType = "AGENT_PING"
-	TypeAgentPong      MessageType = "AGENT_PONG"
-	TypeMetricsUpdate  MessageType = "METRICS_UPDATE"
-	TypeCommandRequest MessageType = "COMMAND_REQUEST"
-	TypeCommandOutput  MessageType = "COMMAND_OUTPUT"
-	TypeCommandResult  MessageType = "COMMAND_RESULT"
-	TypeWriteFile      MessageType = "WRITE_FILE"
-	TypeWriteFileAck   MessageType = "WRITE_FILE_ACK"
-)
-
-type TunnelMessage struct {
-	Type      MessageType     `json:"type"`
-	Payload   json.RawMessage `json:"payload,omitempty"`
-	Timestamp int64           `json:"timestamp"`
-}
+const SocketIoNamespace = "/agent-tunnel"
 
 type Client struct {
 	cfg       *config.Config
@@ -81,7 +65,33 @@ func (c *Client) Start(ctx context.Context) {
 	}
 }
 
+func (c *Client) buildDialURL() (string, error) {
+	raw := c.cfg.ServerURL
+	// Replace protocol for URL parsing if needed
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid server URL: %w", err)
+	}
+
+	scheme := "ws"
+	if u.Scheme == "https" || u.Scheme == "wss" {
+		scheme = "wss"
+	}
+
+	dialURL := fmt.Sprintf("%s://%s/socket.io/?EIO=4&transport=websocket&token=%s",
+		scheme, u.Host, url.QueryEscape(c.cfg.AgentToken))
+	return dialURL, nil
+}
+
 func (c *Client) connectAndServe(ctx context.Context) error {
+	dialURL, err := c.buildDialURL()
+	if err != nil {
+		return err
+	}
+
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
 	}
@@ -93,10 +103,10 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 	headers.Set("Authorization", "Bearer "+c.cfg.AgentToken)
 	headers.Set("User-Agent", "sovrack-agent/1.0.0")
 
-	conn, resp, err := dialer.DialContext(ctx, c.cfg.ServerURL, headers)
+	conn, resp, err := dialer.DialContext(ctx, dialURL, headers)
 	if err != nil {
 		if resp != nil {
-			return fmt.Errorf("handshake failed with status %d: %w", resp.StatusCode, err)
+			return fmt.Errorf("handshake failed with HTTP status %d: %w", resp.StatusCode, err)
 		}
 		return fmt.Errorf("dial failed: %w", err)
 	}
@@ -113,49 +123,88 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 		c.connMu.Unlock()
 	}()
 
-	log.Printf("[Tunnel] Connected successfully to Sovrack gateway!")
+	log.Printf("[Tunnel] WebSocket connected, initiating Socket.io handshake...")
 
-	// 1. Send AGENT_HELLO
+	// 1. Wait for Engine.IO OPEN packet (type '0')
+	_, rawMsg, err := conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("failed to read Engine.IO open packet: %w", err)
+	}
+
+	msgStr := string(rawMsg)
+	if !strings.HasPrefix(msgStr, "0") {
+		return fmt.Errorf("unexpected handshake response: %s", msgStr)
+	}
+
+	// 2. Connect to namespace /agent-tunnel: packet "40/agent-tunnel,{"token":"..."}"
+	connectPayload, _ := json.Marshal(map[string]string{"token": c.cfg.AgentToken})
+	connectPacket := fmt.Sprintf("40%s,%s", SocketIoNamespace, string(connectPayload))
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(connectPacket)); err != nil {
+		return fmt.Errorf("failed to send namespace connect packet: %w", err)
+	}
+
+	// 3. Wait for namespace CONNECT ACK: "40/agent-tunnel,"
+	_, rawAck, err := conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("failed to read namespace connect ACK: %w", err)
+	}
+
+	ackStr := string(rawAck)
+	if !strings.HasPrefix(ackStr, "40"+SocketIoNamespace) && !strings.HasPrefix(ackStr, "42"+SocketIoNamespace) {
+		return fmt.Errorf("namespace connect rejected: %s", ackStr)
+	}
+
+	log.Printf("[Tunnel] Authenticated and attached to %s namespace successfully!", SocketIoNamespace)
+
+	// 4. Send initial AGENT_HELLO
 	if err := c.sendHello(); err != nil {
 		return fmt.Errorf("failed to send hello handshake: %w", err)
 	}
 
-	// 2. Start heartbeat and metrics loops
+	// 5. Start heartbeat and metrics loops
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	go c.heartbeatLoop(childCtx)
 	go c.metricsLoop(childCtx)
 
-	// 3. Process incoming messages
+	// 6. Process incoming messages loop
 	for {
-		_, rawMsg, err := conn.ReadMessage()
+		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			return fmt.Errorf("read error: %w", err)
 		}
 
-		var msg TunnelMessage
-		if err := json.Unmarshal(rawMsg, &msg); err != nil {
-			log.Printf("[Tunnel] Invalid message payload: %v", err)
+		s := string(raw)
+		if s == "2" {
+			// Engine.IO Ping -> respond with Pong "3"
+			c.connMu.Lock()
+			_ = conn.WriteMessage(websocket.TextMessage, []byte("3"))
+			c.connMu.Unlock()
+			continue
+		}
+		if s == "3" {
+			// Engine.IO Pong ack
 			continue
 		}
 
-		go c.handleMessage(childCtx, msg)
+		prefix := "42" + SocketIoNamespace + ","
+		if strings.HasPrefix(s, prefix) {
+			eventJSON := strings.TrimPrefix(s, prefix)
+			go c.handleSocketIoEvent(childCtx, eventJSON)
+		} else if strings.HasPrefix(s, "41"+SocketIoNamespace) {
+			return fmt.Errorf("namespace disconnected by server")
+		}
 	}
 }
 
 func (c *Client) sendHello() error {
 	hostInfo := c.metrics.GetHostInfo()
-	payload, err := json.Marshal(map[string]interface{}{
-		"version":  "1.0.0",
-		"host":     hostInfo,
-		"protocol": "sovrack-agent-v1",
-	})
-	if err != nil {
-		return err
+	payload := map[string]interface{}{
+		"version": "1.0.0",
+		"host":    hostInfo,
 	}
-
-	return c.sendMessage(TypeAgentHello, payload)
+	return c.emitEvent("AGENT_HELLO", payload)
 }
 
 func (c *Client) heartbeatLoop(ctx context.Context) {
@@ -167,7 +216,7 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := c.sendMessage(TypeAgentPing, nil); err != nil {
+			if err := c.emitEvent("AGENT_PING", map[string]interface{}{"timestamp": time.Now().UnixMilli()}); err != nil {
 				log.Printf("[Tunnel] Heartbeat ping failed: %v", err)
 				return
 			}
@@ -188,69 +237,46 @@ func (c *Client) metricsLoop(ctx context.Context) {
 			if err != nil {
 				continue
 			}
-			payload, err := json.Marshal(data)
-			if err != nil {
-				continue
-			}
-			if err := c.sendMessage(TypeMetricsUpdate, payload); err != nil {
+			if err := c.emitEvent("METRICS_UPDATE", data); err != nil {
 				return
 			}
 		}
 	}
 }
 
-func (c *Client) handleMessage(ctx context.Context, msg TunnelMessage) {
-	switch msg.Type {
-	case TypeAgentPing:
-		_ = c.sendMessage(TypeAgentPong, nil)
+func (c *Client) handleSocketIoEvent(ctx context.Context, eventJSON string) {
+	var rawArray []json.RawMessage
+	if err := json.Unmarshal([]byte(eventJSON), &rawArray); err != nil || len(rawArray) < 2 {
+		return
+	}
 
-	case TypeAgentPong:
-		// Heartbeat ack received
+	var eventName string
+	if err := json.Unmarshal(rawArray[0], &eventName); err != nil {
+		return
+	}
 
-	case TypeCommandRequest:
+	switch eventName {
+	case "AGENT_PONG":
+		// Heartbeat acknowledged
+
+	case "CONNECTED_ACK":
+		log.Printf("[Tunnel] Server ACK: authentication confirmed.")
+
+	case "COMMAND_REQUEST":
 		var req executor.CommandRequest
-		if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		if err := json.Unmarshal(rawArray[1], &req); err != nil {
 			log.Printf("[Executor] Invalid command request: %v", err)
 			return
 		}
 
-		log.Printf("[Executor] Executing command [%s]: %s", req.ID, req.Command)
-		res := c.executor.Execute(ctx, req, func(chunk string) {
-			outputPayload, _ := json.Marshal(map[string]interface{}{
-				"id":    req.ID,
-				"chunk": chunk,
-			})
-			_ = c.sendMessage(TypeCommandOutput, outputPayload)
-		})
+		log.Printf("[Executor] Executing command [%s]: %s %v", req.ID, req.Command, req.Args)
+		res := c.executor.Execute(ctx, req, nil)
 
-		resPayload, _ := json.Marshal(res)
-		_ = c.sendMessage(TypeCommandResult, resPayload)
-
-	case TypeWriteFile:
-		var writeReq executor.WriteFileRequest
-		if err := json.Unmarshal(msg.Payload, &writeReq); err != nil {
-			log.Printf("[Executor] Invalid write file request: %v", err)
-			return
-		}
-
-		err := c.executor.WriteFile(writeReq)
-		status := "ok"
-		errMsg := ""
-		if err != nil {
-			status = "error"
-			errMsg = err.Error()
-		}
-
-		ackPayload, _ := json.Marshal(map[string]string{
-			"path":   writeReq.Path,
-			"status": status,
-			"error":  errMsg,
-		})
-		_ = c.sendMessage(TypeWriteFileAck, ackPayload)
+		_ = c.emitEvent("COMMAND_RESULT", res)
 	}
 }
 
-func (c *Client) sendMessage(msgType MessageType, payload []byte) error {
+func (c *Client) emitEvent(eventName string, payload interface{}) error {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 
@@ -258,18 +284,13 @@ func (c *Client) sendMessage(msgType MessageType, payload []byte) error {
 		return fmt.Errorf("connection not established")
 	}
 
-	msg := TunnelMessage{
-		Type:      msgType,
-		Payload:   payload,
-		Timestamp: time.Now().Unix(),
-	}
-
-	bytes, err := json.Marshal(msg)
+	eventData, err := json.Marshal([]interface{}{eventName, payload})
 	if err != nil {
 		return err
 	}
 
-	return c.conn.WriteMessage(websocket.TextMessage, bytes)
+	packet := fmt.Sprintf("42%s,%s", SocketIoNamespace, string(eventData))
+	return c.conn.WriteMessage(websocket.TextMessage, []byte(packet))
 }
 
 func (c *Client) Close() {
